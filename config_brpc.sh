@@ -507,17 +507,29 @@ if [ "$SYSTEM" = "Darwin" ]; then
 fi
 
 if [ $WITH_THRIFT != 0 ]; then
-    THRIFT_LIB=$(find_dir_of_lib_or_die thriftnb)
+    THRIFT_LIB=$(find_dir_of_lib_or_die thrift)
     THRIFT_HDR=$(find_dir_of_header_or_die thrift/Thrift.h)
     append_to_output_libs "$THRIFT_LIB"
     append_to_output_headers "$THRIFT_HDR"
 
     CPPFLAGS="${CPPFLAGS} -DENABLE_THRIFT_FRAMED_PROTOCOL"
 
-    if [ -f "$THRIFT_LIB/libthriftnb.$SO" ]; then
-        append_to_output "DYNAMIC_LINKINGS+=-lthriftnb -levent -lthrift"
+    if [ -f "$THRIFT_LIB/libthrift.$SO" ]; then
+        append_to_output "DYNAMIC_LINKINGS+=-lthrift"
     else
-        append_to_output "STATIC_LINKINGS+=-lthriftnb"
+        append_to_output "STATIC_LINKINGS+=-lthrift"
+    fi
+    # libthriftnb (the libevent-based nonblocking server) only exists in old
+    # thrift releases; it has been merged into libthrift since thrift 0.10.
+    # Link it only when building against such an old thrift.
+    THRIFTNB_LIB=$(find_dir_of_lib thriftnb)
+    if [ ! -z "$THRIFTNB_LIB" ]; then
+        append_to_output_libs "$THRIFTNB_LIB"
+        if [ -f "$THRIFTNB_LIB/libthriftnb.$SO" ]; then
+            append_to_output "DYNAMIC_LINKINGS+=-lthriftnb -levent"
+        else
+            append_to_output "STATIC_LINKINGS+=-lthriftnb"
+        fi
     fi
     # get thrift version
     thrift_version=$(thrift --version | awk '{print $3}')
