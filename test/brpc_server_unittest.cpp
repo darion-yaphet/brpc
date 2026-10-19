@@ -419,6 +419,61 @@ TEST_F(ServerTest, failed_start_keeps_keytable_pool_for_init_bthreads) {
     ASSERT_EQ(0, bthread_key_delete(g_init_child_key));
 }
 
+struct InitChildTLSArgs {
+    brpc::Server* server;
+    const brpc::DataFactory* factory;
+    bthread_key_t key;
+    bthread::CountdownEvent data_created;
+    bthread::CountdownEvent may_exit;
+};
+
+static bthread_t g_tls_init_child = INVALID_BTHREAD;
+
+static void* InitChildUsingServerTLS(void* arg) {
+    InitChildTLSArgs* args = static_cast<InitChildTLSArgs*>(arg);
+    void* data = args->factory->CreateData();
+    EXPECT_NE(nullptr, data);
+    EXPECT_EQ(0, bthread_setspecific(args->key, data));
+    args->data_created.signal();
+    EXPECT_EQ(0, args->may_exit.wait());
+    return nullptr;
+}
+
+static bool InitFnSpawningTLSChild(void* arg) {
+    InitChildTLSArgs* args = static_cast<InitChildTLSArgs*>(arg);
+    args->key = args->server->thread_local_options().tls_key;
+    bthread_attr_t attr;
+    EXPECT_EQ(0, bthread_getattr(bthread_self(), &attr));
+    if (bthread_start_background(&g_tls_init_child, &attr,
+                                 InitChildUsingServerTLS, args) != 0) {
+        return false;
+    }
+    return args->data_created.wait() == 0;
+}
+
+TEST_F(ServerTest, failed_start_cleans_tls_data_from_outliving_init_bthread) {
+    CountingTLSDataFactory factory;
+    brpc::Server listener;
+    ASSERT_EQ(0, listener.Start("127.0.0.1:0", nullptr));
+    brpc::Server server;
+    InitChildTLSArgs args = { &server, &factory, INVALID_BTHREAD_KEY };
+    brpc::ServerOptions options;
+    options.thread_local_data_factory = &factory;
+    options.bthread_init_fn = InitFnSpawningTLSChild;
+    options.bthread_init_args = &args;
+    options.bthread_init_count = 1;
+
+    ASSERT_EQ(-1, server.Start(listener.listen_address(), &options));
+    EXPECT_EQ(INVALID_BTHREAD_KEY, server._tl_options.tls_key);
+    EXPECT_EQ(1u, factory.created.load(butil::memory_order_relaxed));
+    EXPECT_EQ(0u, factory.destroyed.load(butil::memory_order_relaxed));
+
+    args.may_exit.signal();
+    ASSERT_EQ(0, bthread_join(g_tls_init_child, nullptr));
+    EXPECT_EQ(factory.created.load(butil::memory_order_relaxed),
+              factory.destroyed.load(butil::memory_order_relaxed));
+}
+
 TEST_F(ServerTest, invalid_protocol_in_enabled_protocols) {
     butil::EndPoint ep;
     ASSERT_EQ(0, str2endpoint("127.0.0.1:8613", &ep));

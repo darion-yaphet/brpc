@@ -90,7 +90,11 @@ typedef struct {
     void* list;
     void* free_keytables;
     size_t size;
+    size_t active_bthreads;
+    bthread_key_t deferred_key;
     int destroyed;
+    int destroy_complete;
+    int delete_deferred_key;
 } bthread_keytable_pool_t;
 
 typedef struct {

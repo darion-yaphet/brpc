@@ -37,6 +37,7 @@
 #include "bthread/task_group.h"
 #include "bthread/timer_thread.h"
 #include "bthread/bthread.h"
+#include "bthread/unstable.h"
 
 #ifdef __x86_64__
 #include <x86intrin.h>
@@ -410,6 +411,9 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
             tls_bls_ptr->keytable = nullptr;
             m->local_storage.keytable = nullptr; // optional
         }
+        if (m->attr.keytable_pool != nullptr) {
+            bthread_keytable_pool_release(m->attr.keytable_pool);
+        }
 
         // During running the function in TaskMeta and deleting the KeyTable in
         // return_KeyTable, the group is probably changed.
@@ -495,6 +499,10 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     m->arg = arg;
     CHECK(m->stack == nullptr);
     m->attr = using_attr;
+    if (m->attr.keytable_pool != nullptr &&
+        !bthread_keytable_pool_addref(m->attr.keytable_pool)) {
+        m->attr.keytable_pool = nullptr;
+    }
     m->local_storage = LOCAL_STORAGE_INIT;
     if (using_attr.flags & BTHREAD_INHERIT_SPAN) {
         if (g_create_bthread_span) {
@@ -569,6 +577,10 @@ int TaskGroup::start_background(bthread_t* __restrict th,
     m->arg = arg;
     CHECK(m->stack == nullptr);
     m->attr = using_attr;
+    if (m->attr.keytable_pool != nullptr &&
+        !bthread_keytable_pool_addref(m->attr.keytable_pool)) {
+        m->attr.keytable_pool = nullptr;
+    }
     m->local_storage = LOCAL_STORAGE_INIT;
     if (using_attr.flags & BTHREAD_INHERIT_SPAN) {
         if (g_create_bthread_span) {

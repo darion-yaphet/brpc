@@ -427,6 +427,98 @@ TEST(KeyTest, using_pool) {
     ASSERT_EQ(0, bthread_key_delete(key));
 }
 
+struct ConcurrentPoolData {
+    bthread_key_t key;
+    bthread_attr_t attr;
+    butil::atomic<size_t> started {0};
+    butil::atomic<bool> may_exit {false};
+    butil::atomic<bool> failed {false};
+    butil::atomic<size_t> destroyed {0};
+    bthread_t tids[64];
+};
+
+struct ConcurrentPoolStartArgs {
+    ConcurrentPoolData* data;
+    size_t first;
+    size_t count;
+};
+
+static void concurrent_pool_dtor(void* arg) {
+    static_cast<ConcurrentPoolData*>(arg)->destroyed.fetch_add(
+        1, butil::memory_order_relaxed);
+}
+
+static void* concurrent_pool_worker(void* arg) {
+    ConcurrentPoolData* data = static_cast<ConcurrentPoolData*>(arg);
+    if (bthread_setspecific(data->key, data) != 0) {
+        ADD_FAILURE() << "Failed to set concurrent pool TLS";
+        data->failed.store(true, butil::memory_order_release);
+        return nullptr;
+    }
+    data->started.fetch_add(1, butil::memory_order_release);
+    while (!data->may_exit.load(butil::memory_order_acquire)) {
+        bthread_usleep(1000);
+    }
+    return nullptr;
+}
+
+static void* start_concurrent_pool_bthreads(void* arg) {
+    ConcurrentPoolStartArgs* args = static_cast<ConcurrentPoolStartArgs*>(arg);
+    for (size_t i = 0; i < args->count; ++i) {
+        if (bthread_start_background(&args->data->tids[args->first + i],
+                                     &args->data->attr,
+                                     concurrent_pool_worker, args->data) != 0) {
+            ADD_FAILURE() << "Failed to start concurrent pool bthread";
+            args->data->failed.store(true, butil::memory_order_release);
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+TEST(KeyTest, defer_key_deletion_until_concurrent_bthreads_exit) {
+    ConcurrentPoolData data;
+    ASSERT_EQ(0, bthread_key_create(&data.key, concurrent_pool_dtor));
+
+    bthread_keytable_pool_t pool;
+    ASSERT_EQ(0, bthread_keytable_pool_init(&pool));
+    ASSERT_EQ(0, bthread_attr_init(&data.attr));
+    data.attr.keytable_pool = &pool;
+
+    const size_t kStarterCount = 8;
+    const size_t kBthreadsPerStarter = arraysize(data.tids) / kStarterCount;
+    pthread_t starters[kStarterCount];
+    ConcurrentPoolStartArgs args[kStarterCount];
+    for (size_t i = 0; i < kStarterCount; ++i) {
+        args[i] = { &data, i * kBthreadsPerStarter, kBthreadsPerStarter };
+        ASSERT_EQ(0, pthread_create(&starters[i], nullptr,
+                                    start_concurrent_pool_bthreads, &args[i]));
+    }
+    for (size_t i = 0; i < arraysize(starters); ++i) {
+        ASSERT_EQ(0, pthread_join(starters[i], nullptr));
+    }
+    ASSERT_FALSE(data.failed.load(butil::memory_order_acquire));
+    while (data.started.load(butil::memory_order_acquire) !=
+           arraysize(data.tids)) {
+        ASSERT_FALSE(data.failed.load(butil::memory_order_acquire));
+        bthread_usleep(1000);
+    }
+
+    EXPECT_EQ(arraysize(data.tids), pool.active_bthreads);
+    ASSERT_EQ(0, bthread_keytable_pool_destroy_and_delete_key(&pool, data.key));
+    EXPECT_EQ(1, pool.delete_deferred_key);
+
+    data.may_exit.store(true, butil::memory_order_release);
+    for (size_t i = 0; i < arraysize(data.tids); ++i) {
+        ASSERT_EQ(0, bthread_join(data.tids[i], nullptr));
+    }
+    EXPECT_EQ(arraysize(data.tids),
+              data.destroyed.load(butil::memory_order_relaxed));
+    EXPECT_EQ(0u, pool.active_bthreads);
+    EXPECT_EQ(0, pool.delete_deferred_key);
+    EXPECT_EQ(INVALID_BTHREAD_KEY, pool.deferred_key);
+}
+
 bthread_keytable_pool_t test_pool;
 struct PoolData2 {
     bthread_key_t key;
@@ -564,6 +656,72 @@ TEST(KeyTest, borrow_and_return_keytable_when_using_pool) {
     table_list.clear();
 
     ASSERT_EQ(0, bthread_keytable_pool_destroy(&test_pool));
+}
+
+struct ConcurrentBorrowData {
+    bthread_keytable_pool_t pool;
+    butil::atomic<size_t> started {0};
+    butil::atomic<size_t> attempts {0};
+    butil::atomic<size_t> destroyed {0};
+    butil::atomic<bool> stop {false};
+};
+
+static void* create_concurrent_borrow_data(const void* arg) {
+    return const_cast<void*>(arg);
+}
+
+static void destroy_concurrent_borrow_data(void* arg) {
+    static_cast<ConcurrentBorrowData*>(arg)->destroyed.fetch_add(
+        1, butil::memory_order_relaxed);
+}
+
+static void* borrow_while_destroying_pool(void* arg) {
+    ConcurrentBorrowData* data = static_cast<ConcurrentBorrowData*>(arg);
+    bthread::return_keytable(&data->pool,
+                            bthread::borrow_keytable(&data->pool));
+    data->started.fetch_add(1, butil::memory_order_release);
+    while (!data->stop.load(butil::memory_order_acquire)) {
+        bthread::KeyTable* kt = bthread::borrow_keytable(&data->pool);
+        bthread::return_keytable(&data->pool, kt);
+        data->attempts.fetch_add(1, butil::memory_order_relaxed);
+    }
+    EXPECT_EQ(nullptr, bthread::borrow_keytable(&data->pool));
+    return nullptr;
+}
+
+TEST(KeyTest, borrow_keytable_during_pool_destruction) {
+    ConcurrentBorrowData data;
+    ASSERT_EQ(0, bthread_keytable_pool_init(&data.pool));
+    bthread_key_t key;
+    ASSERT_EQ(0, bthread_key_create(&key, destroy_concurrent_borrow_data));
+    const size_t kReserved = 64;
+    bthread_keytable_pool_reserve(&data.pool, kReserved, key,
+                                  create_concurrent_borrow_data, &data);
+
+    pthread_t threads[4];
+    size_t ncreated = 0;
+    for (; ncreated < arraysize(threads); ++ncreated) {
+        const int rc = pthread_create(&threads[ncreated], nullptr,
+                                       borrow_while_destroying_pool, &data);
+        EXPECT_EQ(0, rc);
+        if (rc != 0) {
+            break;
+        }
+    }
+    if (ncreated != 0) {
+        while (data.started.load(butil::memory_order_acquire) != ncreated ||
+               data.attempts.load(butil::memory_order_relaxed) < kReserved) {
+            sched_yield();
+        }
+    }
+    EXPECT_EQ(0, bthread_keytable_pool_destroy(&data.pool));
+    data.stop.store(true, butil::memory_order_release);
+    for (size_t i = 0; i < ncreated; ++i) {
+        EXPECT_EQ(0, pthread_join(threads[i], nullptr));
+    }
+    EXPECT_EQ(nullptr, bthread::borrow_keytable(&data.pool));
+    EXPECT_EQ(kReserved, data.destroyed.load(butil::memory_order_relaxed));
+    EXPECT_EQ(0, bthread_key_delete(key));
 }
 
 // NOTE: lid is short for 'lock in dtor'.

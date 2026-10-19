@@ -121,6 +121,19 @@ extern int bthread_keytable_pool_init(bthread_keytable_pool_t*);
 // Returns 0 on success, error code otherwise.
 extern int bthread_keytable_pool_destroy(bthread_keytable_pool_t*);
 
+// Destroy the pool and delete `key' after all bthreads created with this pool
+// have exited. This keeps the key valid while their KeyTables are destroyed.
+// Returns 0 on success, error code otherwise.
+extern int bthread_keytable_pool_destroy_and_delete_key(
+    bthread_keytable_pool_t*, bthread_key_t key);
+
+// Track a bthread created with `pool'. Returns 0 when the pool has already
+// been destroyed and the bthread must not retain the pool.
+extern int bthread_keytable_pool_addref(bthread_keytable_pool_t*);
+
+// Release a bthread previously tracked with bthread_keytable_pool_addref().
+extern void bthread_keytable_pool_release(bthread_keytable_pool_t*);
+
 // [RPC INTERNAL]
 // Put statistics of `pool' into `stat'.
 extern int bthread_keytable_pool_getstat(bthread_keytable_pool_t* pool,

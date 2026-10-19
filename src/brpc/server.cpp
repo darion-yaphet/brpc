@@ -1369,9 +1369,16 @@ void Server::DestroyPreStartAllocations() {
 
 void Server::DestroyThreadLocalResources() {
     if (_keytable_pool != nullptr) {
-        // Keep the TLS key valid until its pooled data has been destroyed.
-        // Deleting the key first would disable DestroyServerTLS().
-        CHECK_EQ(0, bthread_keytable_pool_destroy(_keytable_pool));
+        // Keep the TLS key valid until every bthread created with this pool
+        // has returned its KeyTable. Deleting it sooner would disable
+        // DestroyServerTLS() for an init bthread that outlives this server.
+        if (_tl_options.tls_key != INVALID_BTHREAD_KEY) {
+            CHECK_EQ(0, bthread_keytable_pool_destroy_and_delete_key(
+                            _keytable_pool, _tl_options.tls_key));
+            _tl_options.tls_key = INVALID_BTHREAD_KEY;
+        } else {
+            CHECK_EQ(0, bthread_keytable_pool_destroy(_keytable_pool));
+        }
         // Don't delete the pool struct. Bthreads created with
         // attr.keytable_pool == _keytable_pool may outlive shutdown or
         // a failed start and still call return_keytable() on exit. A
@@ -1380,7 +1387,7 @@ void Server::DestroyThreadLocalResources() {
         // StartInternal().
         _keytable_pool = nullptr;
     }
-    // Delete tls_key created in StartInternal().
+    // No bthread can reference a key created without a keytable pool.
     if (_tl_options.tls_key != INVALID_BTHREAD_KEY) {
         CHECK_EQ(0, bthread_key_delete(_tl_options.tls_key));
         _tl_options.tls_key = INVALID_BTHREAD_KEY;

@@ -322,10 +322,15 @@ private:
 };
 
 KeyTable* borrow_keytable(bthread_keytable_pool_t* pool) {
-    if (pool != nullptr && (pool->list || pool->free_keytables)) {
+    if (pool != nullptr) {
         KeyTable* p;
+        bool has_free_keytables;
         {
             pthread_rwlock_rdlock(&pool->rwlock);
+            if (pool->destroyed) {
+                pthread_rwlock_unlock(&pool->rwlock);
+                return nullptr;
+            }
             auto list = (butil::ThreadLocal<bthread::KeyTableList>*)pool->list;
             if (list) {
                 p = list->get()->remove_front();
@@ -334,9 +339,10 @@ KeyTable* borrow_keytable(bthread_keytable_pool_t* pool) {
                     return p;
                 }
             }
+            has_free_keytables = pool->free_keytables != nullptr;
             pthread_rwlock_unlock(&pool->rwlock);
         }
-        if (pool->free_keytables) {
+        if (has_free_keytables) {
             pthread_rwlock_wrlock(&pool->rwlock);
             if (pool->destroyed) {
                 pthread_rwlock_unlock(&pool->rwlock);
@@ -462,11 +468,17 @@ int bthread_keytable_pool_init(bthread_keytable_pool_t* pool) {
     pool->list = new butil::ThreadLocal<bthread::KeyTableList>();
     pool->free_keytables = nullptr;
     pool->size = 0;
+    pool->active_bthreads = 0;
+    pool->deferred_key = INVALID_BTHREAD_KEY;
     pool->destroyed = 0;
+    pool->destroy_complete = 0;
+    pool->delete_deferred_key = 0;
     return 0;
 }
 
-int bthread_keytable_pool_destroy(bthread_keytable_pool_t* pool) {
+static int destroy_keytable_pool(bthread_keytable_pool_t* pool,
+                                 bthread_key_t deferred_key,
+                                 bool delete_deferred_key) {
     if (pool == nullptr) {
         LOG(ERROR) << "Param[pool] is NULL";
         return EINVAL;
@@ -475,6 +487,9 @@ int bthread_keytable_pool_destroy(bthread_keytable_pool_t* pool) {
     pthread_rwlock_wrlock(&pool->rwlock);
     pool->destroyed = 1;
     pool->size = 0;
+    pool->deferred_key = deferred_key;
+    pool->delete_deferred_key = delete_deferred_key;
+    pool->destroy_complete = 0;
     delete (butil::ThreadLocal<bthread::KeyTableList>*)pool->list;
     saved_free_keytables = (bthread::KeyTable*)pool->free_keytables;
     pool->list = nullptr;
@@ -499,10 +514,65 @@ int bthread_keytable_pool_destroy(bthread_keytable_pool_t* pool) {
     if (g) {
         g->current_task()->local_storage.keytable = old_kt;
     }
+
+    bthread_key_t key_to_delete = INVALID_BTHREAD_KEY;
+    pthread_rwlock_wrlock(&pool->rwlock);
+    pool->destroy_complete = 1;
+    if (pool->delete_deferred_key && pool->active_bthreads == 0) {
+        pool->delete_deferred_key = 0;
+        key_to_delete = pool->deferred_key;
+        pool->deferred_key = INVALID_BTHREAD_KEY;
+    }
+    pthread_rwlock_unlock(&pool->rwlock);
+    if (key_to_delete != INVALID_BTHREAD_KEY) {
+        CHECK_EQ(0, bthread_key_delete(key_to_delete));
+    }
     // TODO: return_keytable may race with this function, we don't destroy
     // the mutex right now.
     // pthread_mutex_destroy(&pool->mutex);
     return 0;
+}
+
+int bthread_keytable_pool_destroy(bthread_keytable_pool_t* pool) {
+    return destroy_keytable_pool(pool, INVALID_BTHREAD_KEY, false);
+}
+
+int bthread_keytable_pool_destroy_and_delete_key(
+    bthread_keytable_pool_t* pool, bthread_key_t key) {
+    return destroy_keytable_pool(pool, key, true);
+}
+
+int bthread_keytable_pool_addref(bthread_keytable_pool_t* pool) {
+    if (pool == nullptr) {
+        return 0;
+    }
+    pthread_rwlock_wrlock(&pool->rwlock);
+    const bool usable = !pool->destroyed;
+    if (usable) {
+        ++pool->active_bthreads;
+    }
+    pthread_rwlock_unlock(&pool->rwlock);
+    return usable ? 1 : 0;
+}
+
+void bthread_keytable_pool_release(bthread_keytable_pool_t* pool) {
+    if (pool == nullptr) {
+        return;
+    }
+    bthread_key_t key_to_delete = INVALID_BTHREAD_KEY;
+    pthread_rwlock_wrlock(&pool->rwlock);
+    CHECK_GT(pool->active_bthreads, 0u);
+    --pool->active_bthreads;
+    if (pool->destroyed && pool->destroy_complete &&
+        pool->delete_deferred_key && pool->active_bthreads == 0) {
+        pool->delete_deferred_key = 0;
+        key_to_delete = pool->deferred_key;
+        pool->deferred_key = INVALID_BTHREAD_KEY;
+    }
+    pthread_rwlock_unlock(&pool->rwlock);
+    if (key_to_delete != INVALID_BTHREAD_KEY) {
+        CHECK_EQ(0, bthread_key_delete(key_to_delete));
+    }
 }
 
 int bthread_keytable_pool_getstat(bthread_keytable_pool_t* pool,
